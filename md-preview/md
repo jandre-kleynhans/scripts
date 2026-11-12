@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""md — live GitHub-flavoured Markdown preview.
+
+Usage:
+  md <file>
+
+Starts a local server, opens your browser, and re-renders the file
+as GitHub Flavoured Markdown with GitHub's styling whenever you save.
+Raw HTML in the file is rendered alongside Markdown, and Markdown inside
+HTML blocks (for example a heading in a <div>) is rendered too. Press Ctrl+C to stop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+VERSION = "1.2.0"
+CACHE_DIR = Path.home() / ".cache" / "md-preview" / "v1"
+POLL_SECONDS = 0.15
+
+# Pinned CDN copies, hashed so the cache cannot be quietly swapped.
+ASSETS = {
+    "github-markdown-light.css": (
+        "https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown-light.css",
+        "sha256:a1a198514565120cb1660fcb4583e3eaa00d84294ef8cf989d6c6aa7ffc0e1c0",
+    ),
+    "marked.min.js": (
+        "https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js",
+        "sha256:3e7e7d7feb3e5d58cb6c804f68ab5c24cc7e5eb6270fd6e5cbb9124739217d0c",
+    ),
+    "highlight.min.js": (
+        "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js",
+        "sha256:c4a399dd6f488bc97a3546e3476747b3e714c99c57b9473154c6fb8d259b9381",
+    ),
+    "github.min.css": (
+        "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github.min.css",
+        "sha256:3a9a5def8b9c311e5ae43abde85c63133185eed4f0d9f67fea4b00a8308cf066",
+    ),
+}
+
+# Bundled next to this script, used when present so first run works offline.
+BUNDLE_DIR = Path(__file__).resolve().parent / "assets"
+
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>__TITLE__</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23242692e'/%3E%3Ctext x='8' y='12' text-anchor='middle' font-size='10' font-family='-apple-system,sans-serif' fill='white'%3EM%3C/text%3E%3C/svg%3E">
+<style>
+  @layer md-preview-gfm, md-preview-hljs, md-preview-chrome;
+  @import url("/asset/github-markdown-light.css") layer(md-preview-gfm);
+  @import url("/asset/github.min.css") layer(md-preview-hljs);
+
+  @layer md-preview-chrome {
+    html, body {
+      margin: 0;
+      background: #ffffff;
+      color-scheme: light;
+    }
+    .markdown-body {
+      box-sizing: border-box;
+      min-width: 200px;
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 45px;
+    }
+    @media (max-width: 767px) {
+      .markdown-body { padding: 15px; }
+    }
+    .markdown-body pre code.hljs {
+      display: block;
+      padding: 0;
+      background: transparent;
+      overflow: visible;
+      color: inherit;
+    }
+    .empty {
+      color: #656d76;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+      margin: 0;
+    }
+  }
+</style>
+</head>
+<body>
+  <article id="content" class="markdown-body">
+    <p class="empty">Loading…</p>
+  </article>
+  <script src="/asset/marked.min.js"></script>
+  <script src="/asset/highlight.min.js"></script>
+  <script>
+  (function () {
+""" + r"""
+    function enableMarkdownInHtml(src) {
+      const RAW = new Set([
+        "script", "style", "pre", "code", "textarea",
+        "svg", "math", "noscript", "iframe", "canvas"
+      ]);
+      const CONTAINER = new Set([
+        "div", "section", "article", "main", "aside", "header", "footer", "nav",
+        "blockquote", "figure", "figcaption", "details", "summary", "center",
+        "td", "th", "tr", "thead", "tbody", "tfoot", "table",
+        "li", "ul", "ol", "dl", "dt", "dd", "fieldset", "address"
+      ]);
+
+      const fences = [];
+      const codes = [];
+      let text = protectFences(src, fences);
+      text = protectInlineCode(text, codes);
+      text = padContainers(text, RAW, CONTAINER);
+      text = restore(text, "MDPREVIEW-CODE-", codes);
+      text = restore(text, "MDPREVIEW-FENCE-", fences);
+      return text;
+    }
+
+    function restore(text, prefix, stored) {
+      for (let i = stored.length - 1; i >= 0; i--) {
+        text = text.split("<!--" + prefix + i + "-->").join(stored[i]);
+      }
+      return text;
+    }
+
+    function protectFences(src, stored) {
+      const lines = src.split("\n");
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        const open = fenceOpen(lines[i]);
+        if (open) {
+          const start = i;
+          i += 1;
+          while (i < lines.length && !fenceClose(lines[i], open)) i += 1;
+          if (i < lines.length) i += 1;
+          stored.push(lines.slice(start, i).join("\n"));
+          out.push("<!--MDPREVIEW-FENCE-" + (stored.length - 1) + "-->");
+        } else {
+          out.push(lines[i]);
+          i += 1;
+        }
+      }
+      return out.join("\n");
+    }
+
+    function fenceOpen(line) {
+      const m = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (!m) return null;
+      return { char: m[1][0], len: m[1].length };
+    }
+
+    function fenceClose(line, open) {
+      const m = line.match(/^ {0,3}(`{3,}|~{3,})[ \t]*$/);
+      if (!m || m[1][0] !== open.char || m[1].length < open.len) return false;
+      return true;
+    }
+
+    function protectInlineCode(src, stored) {
+      const lines = src.split("\n");
+      for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        let out = "";
+        let i = 0;
+        while (i < line.length) {
+          if (line[i] !== "`") {
+            out += line[i];
+            i += 1;
+            continue;
+          }
+          let n = 1;
+          while (i + n < line.length && line[i + n] === "`") n += 1;
+          let j = i + n;
+          let found = -1;
+          while (j < line.length) {
+            if (line[j] === "`") {
+              let m = 1;
+              while (j + m < line.length && line[j + m] === "`") m += 1;
+              if (m === n) {
+                found = j + m;
+                break;
+              }
+              j += m;
+            } else {
+              j += 1;
+            }
+          }
+          if (found !== -1) {
+            stored.push(line.slice(i, found));
+            out += "<!--MDPREVIEW-CODE-" + (stored.length - 1) + "-->";
+            i = found;
+          } else {
+            out += line[i];
+            i += 1;
+          }
+        }
+        lines[li] = out;
+      }
+      return lines.join("\n");
+    }
+
+    function readQuoted(s, i) {
+      const q = s[i];
+      i += 1;
+      while (i < s.length && s[i] !== q) i += 1;
+      return i < s.length ? i + 1 : i;
+    }
+
+    function readMarkup(s, i) {
+      if (s[i] !== "<") return null;
+      if (s.startsWith("<!--", i)) {
+        const end = s.indexOf("-->", i + 4);
+        return { kind: "comment", end: end === -1 ? s.length : end + 3 };
+      }
+      if (s.startsWith("<![CDATA[", i)) {
+        const end = s.indexOf("]]>", i + 9);
+        return { kind: "cdata", end: end === -1 ? s.length : end + 3 };
+      }
+      if (s.startsWith("<!", i)) {
+        const end = s.indexOf(">", i + 2);
+        return { kind: "decl", end: end === -1 ? s.length : end + 1 };
+      }
+      if (s.startsWith("<?", i)) {
+        const end = s.indexOf("?>", i + 2);
+        return { kind: "pi", end: end === -1 ? s.length : (s.indexOf(">", i + 2) + 1 || s.length) };
+      }
+      let j = i + 1;
+      let kind = "open";
+      if (s[j] === "/") {
+        kind = "close";
+        j += 1;
+      }
+      if (j >= s.length || !/[A-Za-z]/.test(s[j])) return null;
+      const nameStart = j;
+      j += 1;
+      while (j < s.length && /[A-Za-z0-9:-]/.test(s[j])) j += 1;
+      const tag = s.slice(nameStart, j);
+      while (j < s.length) {
+        const c = s[j];
+        if (c === ">") return { kind: kind, tag: tag, selfClosing: false, end: j + 1 };
+        if (c === "/" && s[j + 1] === ">") return { kind: kind, tag: tag, selfClosing: true, end: j + 2 };
+        if (c === '"' || c === "'") {
+          j = readQuoted(s, j);
+          continue;
+        }
+        j += 1;
+      }
+      return { kind: "incomplete", tag: tag, end: s.length };
+    }
+
+    function padContainers(s, RAW, CONTAINER) {
+      const stack = [];
+      const ranges = [];
+      let i = 0;
+      while (i < s.length) {
+        const lt = s.indexOf("<", i);
+        if (lt === -1) break;
+        const t = readMarkup(s, lt);
+        if (!t) {
+          i = lt + 1;
+          continue;
+        }
+        if (t.kind === "open" && !t.selfClosing) {
+          const lower = t.tag.toLowerCase();
+          if (RAW.has(lower)) {
+            const closeTag = "</" + lower;
+            let k = t.end;
+            let found = false;
+            while (k < s.length) {
+              const p = s.toLowerCase().indexOf(closeTag, k);
+              if (p === -1) break;
+              const end = readMarkup(s, p);
+              if (end && end.kind === "close" && end.tag.toLowerCase() === lower) {
+                i = end.end;
+                found = true;
+                break;
+              }
+              k = p + 1;
+            }
+            if (!found) i = t.end;
+            continue;
+          }
+          stack.push({ tag: lower, openStart: lt, openEnd: t.end });
+        } else if (t.kind === "close") {
+          const lower = t.tag.toLowerCase();
+          for (let k = stack.length - 1; k >= 0; k--) {
+            if (stack[k].tag === lower) {
+              if (CONTAINER.has(lower)) {
+                ranges.push({
+                  openEnd: stack[k].openEnd,
+                  closeStart: lt
+                });
+              }
+              stack.length = k;
+              break;
+            }
+          }
+        }
+        i = t.end;
+      }
+
+      const inserts = [];
+      for (let r = 0; r < ranges.length; r++) {
+        const inner = s.slice(ranges[r].openEnd, ranges[r].closeStart);
+        if (!/^\n[ \t]*\n/.test(inner)) {
+          inserts.push({
+            at: ranges[r].openEnd,
+            text: inner.charAt(0) === "\n" ? "\n" : "\n\n"
+          });
+        }
+        if (!/\n[ \t]*\n[ \t]*$/.test(inner)) {
+          inserts.push({
+            at: ranges[r].closeStart,
+            text: inner.charAt(inner.length - 1) === "\n" ? "\n" : "\n\n"
+          });
+        }
+      }
+      inserts.sort(function (a, b) { return b.at - a.at; });
+      let out = s;
+      for (let r = 0; r < inserts.length; r++) {
+        const ins = inserts[r];
+        out = out.slice(0, ins.at) + ins.text + out.slice(ins.at);
+      }
+      return out;
+    }
+""" + """
+    const content = document.getElementById("content");
+    let last = null;
+    let bust = 0;
+
+    function looksLikeRtf(md) {
+      return md.replace(/^\\s+/, "").startsWith("{\\\\rtf");
+    }
+
+    function cacheBustImages() {
+      content.querySelectorAll("img").forEach(function (img) {
+        try {
+          const u = new URL(img.getAttribute("src"), location.origin + "/files/");
+          if (u.origin === location.origin) {
+            u.searchParams.set("v", String(bust));
+            img.setAttribute("src", u.pathname + u.search);
+          }
+        } catch (e) {}
+      });
+    }
+
+    function clearUserStyles() {
+      document.querySelectorAll("style[data-md-preview]").forEach(function (el) {
+        el.remove();
+      });
+    }
+
+    function applyUserHtml(root) {
+      clearUserStyles();
+      // Re-insert <style> into <head> so it applies in every browser,
+      // including when the tag arrived through innerHTML.
+      root.querySelectorAll("style").forEach(function (el) {
+        const s = document.createElement("style");
+        s.setAttribute("data-md-preview", "");
+        s.textContent = el.textContent;
+        document.head.appendChild(s);
+        el.remove();
+      });
+    }
+
+    function render(md) {
+      const y = window.scrollY;
+      if (!md.trim()) {
+        clearUserStyles();
+        content.innerHTML = '<p class="empty">This file is empty. Write some Markdown and save to see it here.</p>';
+      } else if (looksLikeRtf(md)) {
+        clearUserStyles();
+        content.innerHTML = '<p class="empty">This looks like a Rich Text file. In TextEdit, choose Format &gt; Make Plain Text, then save.</p>';
+      } else {
+        content.innerHTML = marked.parse(enableMarkdownInHtml(md), { gfm: true, breaks: false });
+        applyUserHtml(content);
+        content.querySelectorAll("pre code").forEach(function (el) {
+          try { hljs.highlightElement(el); } catch (e) {}
+        });
+        cacheBustImages();
+      }
+      window.scrollTo(0, y);
+    }
+
+    const es = new EventSource("/events");
+    es.onmessage = function (ev) {
+      const data = JSON.parse(ev.data);
+      bust = data.v;
+      if (data.md !== last) {
+        last = data.md;
+        render(data.md);
+      } else {
+        cacheBustImages();
+      }
+    };
+    es.onerror = function () {
+      if (es.readyState === EventSource.CLOSED) {
+        content.insertAdjacentHTML(
+          "afterbegin",
+          '<p class="empty" id="disconnected">Preview server stopped. Run md again to restart.</p>'
+        );
+      }
+    };
+  })();
+  </script>
+</body>
+</html>
+"""
+
+
+class Hub:
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.version = 0
+        self.text = ""
+        self.stop = threading.Event()
+
+    def update(self, text: str, force: bool = False) -> None:
+        with self.cond:
+            if text != self.text or force:
+                self.text = text
+                self.version += 1
+                self.cond.notify_all()
+
+
+def read_markdown(path: Path) -> str:
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def looks_like_rtf(text: str) -> bool:
+    return text.lstrip().startswith(r"{\rtf")
+
+
+def ensure_assets() -> Path:
+    """Return a directory that holds the CSS and JS files."""
+    if all((BUNDLE_DIR / name).is_file() for name in ASSETS):
+        return BUNDLE_DIR
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    missing = []
+    for name, (url, expected) in ASSETS.items():
+        dest = CACHE_DIR / name
+        if dest.is_file() and sha256_file(dest) == expected:
+            continue
+        missing.append((name, url, expected, dest))
+    if missing:
+        print("Downloading GitHub preview styles (first run only)…", file=sys.stderr)
+        for name, url, expected, dest in missing:
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    data = resp.read()
+            except Exception as exc:
+                raise SystemExit(
+                    f"md: could not download {name} from {url}\n{exc}"
+                ) from exc
+            digest = "sha256:" + hashlib.sha256(data).hexdigest()
+            if digest != expected:
+                raise SystemExit(
+                    f"md: unexpected contents for {name} (got {digest}, wanted {expected})"
+                )
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(dest)
+    return CACHE_DIR
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def watch(path: Path, hub: Hub) -> None:
+    last_key = None
+    last_dir_key = None
+    while not hub.stop.is_set():
+        md_changed = False
+        try:
+            st = path.stat()
+            key = (st.st_mtime_ns, st.st_size, st.st_ino)
+            if key != last_key:
+                hub.update(read_markdown(path))
+                last_key = key
+                md_changed = True
+        except FileNotFoundError:
+            # TextEdit and others save atomically: the file vanishes briefly.
+            pass
+        except OSError:
+            pass
+
+        # If a sibling image changes, refresh without waiting for a Markdown save.
+        try:
+            dir_key = directory_stamp(path.parent)
+            if (
+                not md_changed
+                and last_dir_key is not None
+                and dir_key != last_dir_key
+            ):
+                try:
+                    text = read_markdown(path)
+                except OSError:
+                    text = hub.text
+                hub.update(text, force=True)
+            last_dir_key = dir_key
+        except OSError:
+            pass
+
+        hub.stop.wait(POLL_SECONDS)
+
+
+def directory_stamp(folder: Path) -> tuple:
+    items = []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return ()
+    for p in entries:
+        name = p.name
+        if name.startswith(".") or name.endswith(("~", ".tmp", ".swp", ".DS_Store")):
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if p.is_file():
+            items.append((name, st.st_mtime_ns, st.st_size, st.st_ino))
+    items.sort()
+    return tuple(items)
+
+
+def pick_port(preferred: int) -> int:
+    host = "127.0.0.1"
+    if preferred:
+        return bind_or_die(host, preferred)
+    for port in range(8123, 8223):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, port))
+            except OSError:
+                continue
+            return port
+    raise SystemExit("md: could not find a free port on 127.0.0.1")
+
+
+def bind_or_die(host: str, port: int) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as exc:
+            raise SystemExit(f"md: port {port} is not available ({exc})") from exc
+    return port
+
+
+def safe_under(root: Path, relative: str) -> Path | None:
+    if not relative or relative.endswith("/"):
+        return None
+    try:
+        target = (root / relative).resolve()
+        target.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return target if target.is_file() else None
+
+
+def open_browser(url: str) -> None:
+    if sys.platform == "darwin":
+        os.spawnlp(os.P_NOWAIT, "open", "open", url)
+        return
+    webbrowser.open(url)
+
+
+def make_handler(md_path: Path, hub: Hub, asset_dir: Path):
+    root = md_path.parent.resolve()
+    title = md_path.name
+    index = INDEX_HTML.replace("__TITLE__", html_escape(title)).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
+            if path == "/":
+                self._send(200, "text/html; charset=utf-8", index)
+            elif path == "/events":
+                self._sse()
+            elif path.startswith("/asset/"):
+                self._asset(path[len("/asset/") :])
+            elif path == "/favicon.ico":
+                self._send(204, "image/x-icon", b"")
+            elif path.startswith("/files/"):
+                self._file(path[len("/files/") :])
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"not found\n")
+
+        def _send(self, status: int, content_type: str, body: bytes, cache: bool = False) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Cache-Control",
+                "public, max-age=31536000" if cache else "no-store",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _asset(self, name: str) -> None:
+            if name not in ASSETS:
+                self._send(404, "text/plain; charset=utf-8", b"not found\n")
+                return
+            data = (asset_dir / name).read_bytes()
+            ctype = {
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+            }.get(Path(name).suffix, "application/octet-stream")
+            self._send(200, ctype, data, cache=True)
+
+        def _file(self, rel: str) -> None:
+            target = safe_under(root, rel)
+            if target is None:
+                self._send(404, "text/plain; charset=utf-8", b"not found\n")
+                return
+            ctype, _ = mimetypes.guess_type(str(target))
+            self._send(200, ctype or "application/octet-stream", target.read_bytes())
+
+        def _sse(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            last = -1
+            try:
+                while not hub.stop.is_set():
+                    with hub.cond:
+                        while hub.version == last and not hub.stop.is_set():
+                            hub.cond.wait(timeout=15)
+                        if hub.stop.is_set():
+                            break
+                        if hub.version == last:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            continue
+                        last = hub.version
+                        text = hub.text
+                    payload = json.dumps(
+                        {"v": last, "md": text}, ensure_ascii=False
+                    )
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+    return Handler
+
+
+def html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="md",
+        description=(
+            "Live-preview a Markdown file in your browser, rendered as "
+            "GitHub Flavoured Markdown with GitHub's styling. "
+            "Raw HTML is rendered along with the Markdown."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The page updates when you save the file. Press Ctrl+C to stop.",
+    )
+    p.add_argument("file", help="Markdown file to preview")
+    p.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=0,
+        help="port to listen on (default: first free port from 8123)",
+    )
+    p.add_argument(
+        "--no-open",
+        action="store_true",
+        help="do not open a browser",
+    )
+    p.add_argument("--version", action="version", version=f"md {VERSION}")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    path = Path(args.file).expanduser()
+    try:
+        path = path.resolve(strict=True)
+    except FileNotFoundError:
+        print(f"md: no such file: {args.file}", file=sys.stderr)
+        return 1
+    if not path.is_file():
+        print(f"md: not a file: {args.file}", file=sys.stderr)
+        return 1
+
+    try:
+        asset_dir = ensure_assets()
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    hub = Hub()
+    try:
+        hub.update(read_markdown(path))
+    except OSError as exc:
+        print(f"md: could not read {path}: {exc}", file=sys.stderr)
+        return 1
+
+    port = pick_port(args.port)
+    handler = make_handler(path, hub, asset_dir)
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    url = f"http://127.0.0.1:{port}/"
+
+    watcher = threading.Thread(target=watch, args=(path, hub), daemon=True)
+    watcher.start()
+
+    print(f"Previewing {path}")
+    print(url)
+    print("Updates when you save the file (Cmd+S in TextEdit). Press Ctrl+C to stop.")
+    if looks_like_rtf(hub.text):
+        print(
+            "Warning: this looks like a Rich Text file. "
+            "In TextEdit, choose Format > Make Plain Text, then save.",
+            file=sys.stderr,
+        )
+
+    if not args.no_open:
+        threading.Thread(target=lambda: (time.sleep(0.15), open_browser(url)), daemon=True).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        hub.stop.set()
+        with hub.cond:
+            hub.cond.notify_all()
+        server.shutdown()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
