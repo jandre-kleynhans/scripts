@@ -7,7 +7,8 @@ Usage:
 Starts a local server, opens your browser, and re-renders the file
 as GitHub Flavoured Markdown with GitHub's styling whenever you save.
 Raw HTML in the file is rendered alongside Markdown, and Markdown inside
-HTML blocks (for example a heading in a <div>) is rendered too. Press Ctrl+C to stop.
+HTML blocks (for example a heading in a <div>) is rendered too. Click a
+link to another page in the same folder to preview it. Press Ctrl+C to stop.
 """
 
 from __future__ import annotations
@@ -25,9 +26,9 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CACHE_DIR = Path.home() / ".cache" / "md-preview" / "v1"
 POLL_SECONDS = 0.15
 
@@ -349,11 +350,12 @@ INDEX_HTML = """<!DOCTYPE html>
     function cacheBustImages() {
       content.querySelectorAll("img").forEach(function (img) {
         try {
-          const u = new URL(img.getAttribute("src"), location.origin + "/files/");
-          if (u.origin === location.origin) {
-            u.searchParams.set("v", String(bust));
-            img.setAttribute("src", u.pathname + u.search);
-          }
+          const raw = img.getAttribute("src");
+          if (!raw || raw.indexOf("data:") === 0 || raw.indexOf("blob:") === 0) return;
+          const u = new URL(raw, location.href);
+          if (u.origin !== location.origin) return;
+          u.searchParams.set("v", String(bust));
+          img.setAttribute("src", u.pathname + u.search);
         } catch (e) {}
       });
     }
@@ -393,10 +395,18 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         cacheBustImages();
       }
-      window.scrollTo(0, y);
+      if (!last && location.hash) {
+        const id = decodeURIComponent(location.hash.slice(1));
+        const el = id ? document.getElementById(id) : null;
+        if (el) el.scrollIntoView();
+        else window.scrollTo(0, y);
+      } else {
+        window.scrollTo(0, y);
+      }
     }
 
-    const es = new EventSource("/events");
+    const rel = location.pathname === "/" ? "" : location.pathname.slice(1);
+    const es = new EventSource(rel ? "/events?file=" + encodeURIComponent(rel) : "/events");
     es.onmessage = function (ev) {
       const data = JSON.parse(ev.data);
       bust = data.v;
@@ -591,10 +601,24 @@ def open_browser(url: str) -> None:
     webbrowser.open(url)
 
 
+PREVIEW_SUFFIXES = {".md", ".markdown", ".mdown", ".mkd", ".txt", ".html", ".htm"}
+
+
+def preview_target(root: Path, start_file: Path, rel: str) -> Path | None:
+    """Return a previewable file under root, or the starting file for an empty path."""
+    rel = (rel or "").lstrip("/")
+    if not rel:
+        return start_file
+    target = safe_under(root, rel)
+    if target is None:
+        return None
+    if target.suffix.lower() not in PREVIEW_SUFFIXES:
+        return None
+    return target
+
+
 def make_handler(md_path: Path, hub: Hub, asset_dir: Path):
     root = md_path.parent.resolve()
-    title = md_path.name
-    index = INDEX_HTML.replace("__TITLE__", html_escape(title)).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -606,17 +630,29 @@ def make_handler(md_path: Path, hub: Hub, asset_dir: Path):
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
             if path == "/":
-                self._send(200, "text/html; charset=utf-8", index)
+                self._send_preview(md_path)
             elif path == "/events":
-                self._sse()
+                self._sse(parsed.query)
             elif path.startswith("/asset/"):
                 self._asset(path[len("/asset/") :])
             elif path == "/favicon.ico":
                 self._send(204, "image/x-icon", b"")
             elif path.startswith("/files/"):
-                self._file(path[len("/files/") :])
+                self._raw_file(path[len("/files/") :])
             else:
-                self._send(404, "text/plain; charset=utf-8", b"not found\n")
+                rel = path.lstrip("/")
+                target = safe_under(root, rel)
+                if target is None:
+                    self._send(404, "text/plain; charset=utf-8", b"not found\n")
+                elif target.suffix.lower() in PREVIEW_SUFFIXES:
+                    self._send_preview(target)
+                else:
+                    self._raw_file(rel)
+
+        def _send_preview(self, target: Path) -> None:
+            title = target.name
+            body = INDEX_HTML.replace("__TITLE__", html_escape(title)).encode("utf-8")
+            self._send(200, "text/html; charset=utf-8", body)
 
         def _send(self, status: int, content_type: str, body: bytes, cache: bool = False) -> None:
             self.send_response(status)
@@ -642,7 +678,7 @@ def make_handler(md_path: Path, hub: Hub, asset_dir: Path):
             }.get(Path(name).suffix, "application/octet-stream")
             self._send(200, ctype, data, cache=True)
 
-        def _file(self, rel: str) -> None:
+        def _raw_file(self, rel: str) -> None:
             target = safe_under(root, rel)
             if target is None:
                 self._send(404, "text/plain; charset=utf-8", b"not found\n")
@@ -650,32 +686,61 @@ def make_handler(md_path: Path, hub: Hub, asset_dir: Path):
             ctype, _ = mimetypes.guess_type(str(target))
             self._send(200, ctype or "application/octet-stream", target.read_bytes())
 
-        def _sse(self) -> None:
+        def _sse(self, query: str) -> None:
+            qs = parse_qs(query)
+            rel = unquote(qs.get("file", [""])[0])
+            target = preview_target(root, md_path, rel)
+            if target is None:
+                self._send(404, "text/plain; charset=utf-8", b"not found\n")
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
-            last = -1
+            last_key = None
+            last_dir = None
+            last_text = None
+            version = 0
+            last_ping = time.monotonic()
             try:
                 while not hub.stop.is_set():
-                    with hub.cond:
-                        while hub.version == last and not hub.stop.is_set():
-                            hub.cond.wait(timeout=15)
-                        if hub.stop.is_set():
-                            break
-                        if hub.version == last:
-                            self.wfile.write(b": ping\n\n")
+                    sent = False
+                    try:
+                        st = target.stat()
+                        key = (st.st_mtime_ns, st.st_size, st.st_ino)
+                        dir_key = directory_stamp(target.parent)
+                        changed = key != last_key
+                        images_changed = (
+                            last_dir is not None and dir_key != last_dir and not changed
+                        )
+                        if changed:
+                            last_text = read_markdown(target)
+                            last_key = key
+                        if changed or images_changed:
+                            last_dir = dir_key
+                            version += 1
+                            payload = json.dumps(
+                                {"v": version, "md": last_text or "", "file": target.name},
+                                ensure_ascii=False,
+                            )
+                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                             self.wfile.flush()
-                            continue
-                        last = hub.version
-                        text = hub.text
-                    payload = json.dumps(
-                        {"v": last, "md": text}, ensure_ascii=False
-                    )
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
+                            last_ping = time.monotonic()
+                            sent = True
+                        else:
+                            last_dir = dir_key
+                    except FileNotFoundError:
+                        # TextEdit and others save atomically: the file vanishes briefly.
+                        pass
+                    except OSError:
+                        pass
+                    if not sent and time.monotonic() - last_ping >= 15:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        last_ping = time.monotonic()
+                    hub.stop.wait(POLL_SECONDS)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return
 
@@ -697,7 +762,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description=(
             "Live-preview a Markdown file in your browser, rendered as "
             "GitHub Flavoured Markdown with GitHub's styling. "
-            "Raw HTML is rendered along with the Markdown."
+            "Raw HTML is rendered along with the Markdown. Links to other pages in the same folder open in this preview."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="The page updates when you save the file. Press Ctrl+C to stop.",

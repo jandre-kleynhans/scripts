@@ -13,3 +13,5 @@ Ordinary **GitHub Flavoured Markdown** works as usual.
 #### And this heading is Markdown inside a HTML block
 
 </div>
+
+[Open a linked page](linked.md)

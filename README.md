@@ -36,3 +36,5 @@ md --version
 ```
 
 The preview is always light, so colours in your HTML stay as you wrote them, even when the Mac is in Dark Mode.
+
+Links to other pages in the same folder (Markdown or HTML) open in this preview. Use the browser's back button, or a link, to go back. Images and other files in the folder are served as themselves.
